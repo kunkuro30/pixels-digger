@@ -1,0 +1,83 @@
+name: dig
+
+# Parallel nonce search for the Agentic Pixels free dig.
+# Dispatch manually with the ticket data from startDig() (seed + icon + difficulty).
+# Each matrix job scans one slab of the nonce space; the winning job uploads found.txt.
+# Nothing secret lives here: the seed is public on-chain data (DigStarted event).
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Ticket seed (64 hex chars, no 0x)"
+        required: true
+      icon:
+        description: "Ticket icon index (0-15)"
+        required: true
+        default: "0"
+      difficulty:
+        description: "Ticket difficulty (leading bits to match)"
+        required: true
+        default: "36"
+      chunks:
+        description: "How many parallel jobs"
+        required: true
+        default: "32"
+      chunk_size:
+        description: "Nonces per job"
+        required: true
+        default: "4294967296"
+      offset:
+        description: "Nonce offset added to every slab (use to continue past a previous run)"
+        required: true
+        default: "0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          n = int("${{ inputs.chunks }}")
+          print("matrix=" + json.dumps({"chunk": list(range(n))}))
+          EOF
+
+  dig:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 32
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: gcc -O3 -march=native -pthread -o digger digger.c
+      - name: Self-test
+        run: ./digger --selftest
+      - name: Search slab
+        id: search
+        run: |
+          START=$(( ${{ inputs.offset }} + ${{ matrix.chunk }} * ${{ inputs.chunk_size }} ))
+          END=$(( START + ${{ inputs.chunk_size }} ))
+          echo "slab [$START, $END)"
+          set +e
+          ./digger --search "${{ inputs.seed }}" "${{ inputs.icon }}" "${{ inputs.difficulty }}" "$START" "$END" 4 | tee dig.log
+          code=${PIPESTATUS[0]}
+          echo "digger exit code: $code (0 = found, 1 = slab exhausted)"
+          if [ -f found.txt ]; then echo "FOUND in this slab:"; cat found.txt; fi
+          exit 0
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-chunk-${{ matrix.chunk }}
+          path: |
+            found.txt
+            dig.log
+          if-no-files-found: ignore
